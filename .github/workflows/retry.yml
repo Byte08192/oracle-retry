@@ -41,14 +41,17 @@ jobs:
           NTFY: ntfy.sh/minecraft-andrea-x7k29q
           GH_TOKEN: ${{ github.token }}
         run: |
+          set +e +o pipefail
           FINE=$(( $(date +%s) + 19800 ))
           n=0
+          errori=0
           while [ "$(date +%s)" -lt "$FINE" ]; do
             n=$((n+1))
             echo "Tentativo $n - $(date +%H:%M:%S)"
 
             COUNT=$(oci compute instance list --compartment-id "$TENANCY" --lifecycle-state RUNNING --all --query 'length(data)' --raw-output 2>/dev/null)
-            if [ "${COUNT:-0}" -gt 0 ]; then
+            case "$COUNT" in ''|*[!0-9]*) COUNT=0 ;; esac
+            if [ "$COUNT" -gt 0 ]; then
               echo "La macchina esiste gia, fine."
               exit 0
             fi
@@ -57,16 +60,17 @@ jobs:
               --execution-plan-strategy AUTO_APPROVED \
               --wait-for-state SUCCEEDED --wait-for-state FAILED --wait-for-state CANCELED \
               --max-wait-seconds 900 2>/tmp/err)
-            STATE=$(echo "$JOB" | jq -r '.data."lifecycle-state" // empty')
-            JOB_ID=$(echo "$JOB" | jq -r '.data.id // empty')
+            STATE=$(echo "$JOB" | jq -r '.data."lifecycle-state" // empty' 2>/dev/null)
+            JOB_ID=$(echo "$JOB" | jq -r '.data.id // empty' 2>/dev/null)
 
             if [ -z "$JOB_ID" ]; then
-              if grep -qiE "TooManyRequests|429|Conflict|409" /tmp/err; then
-                echo "Oracle occupato, aspetto 3 minuti"; sleep 180; continue
+              errori=$((errori+1))
+              echo "Errore temporaneo nel lancio ($errori/5):"; tail -5 /tmp/err
+              if [ "$errori" -ge 5 ]; then
+                curl -s -H "Title: Script Oracle fermo" -d "5 errori di fila nel lancio, controlla GitHub" "$NTFY"
+                exit 1
               fi
-              echo "ERRORE NEL LANCIO:"; tail -20 /tmp/err
-              curl -s -H "Title: Script Oracle fermo" -d "Errore nel lancio del job, controlla GitHub" "$NTFY"
-              exit 1
+              sleep 180; continue
             fi
 
             if [ "$STATE" = "SUCCEEDED" ]; then
@@ -75,9 +79,21 @@ jobs:
               exit 0
             fi
 
-            LOGS=$(oci resource-manager job get-job-logs-content --job-id "$JOB_ID" --query data --raw-output)
+            LOGS=$(oci resource-manager job get-job-logs-content --job-id "$JOB_ID" --query data --raw-output 2>/dev/null)
+
             if echo "$LOGS" | grep -qi "capacity"; then
+              errori=0
               echo "Out of capacity, riprovo tra 90 secondi"; sleep 90; continue
+            fi
+
+            if [ -z "$LOGS" ] || echo "$LOGS" | grep -qiE "TooManyRequests|429|Conflict|409|InternalError|500|timeout"; then
+              errori=$((errori+1))
+              echo "Errore temporaneo di Oracle ($errori/5), riprovo tra 3 minuti"
+              if [ "$errori" -ge 5 ]; then
+                curl -s -H "Title: Script Oracle fermo" -d "5 errori di fila, controlla GitHub" "$NTFY"
+                exit 1
+              fi
+              sleep 180; continue
             fi
 
             echo "ERRORE DIVERSO:"; echo "$LOGS" | grep -iE "error|fail" | tail -20
