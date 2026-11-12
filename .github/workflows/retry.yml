@@ -1,15 +1,17 @@
 name: Prova macchina Oracle
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+permissions:
+  actions: write
 concurrency:
   group: oracle-retry
   cancel-in-progress: false
 jobs:
   prova:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 350
     steps:
       - uses: actions/setup-python@v5
         with:
@@ -32,38 +34,56 @@ jobs:
           key_file=~/.oci/key.pem
           EOF
           chmod 600 ~/.oci/config
-      - name: Prova a creare la macchina
+      - name: Prova finche non trova la macchina
         env:
           STACK_ID: ${{ secrets.STACK_ID }}
           TENANCY: ${{ secrets.OCI_TENANCY }}
           NTFY: ntfy.sh/minecraft-andrea-x7k29q
+          GH_TOKEN: ${{ github.token }}
         run: |
-          COUNT=$(oci compute instance list --compartment-id "$TENANCY" --lifecycle-state RUNNING --all --query 'length(data)' --raw-output 2>/dev/null)
-          if [ "${COUNT:-0}" -gt 0 ]; then echo "La macchina esiste gia, niente da fare"; exit 0; fi
+          FINE=$(( $(date +%s) + 19800 ))
+          n=0
+          while [ "$(date +%s)" -lt "$FINE" ]; do
+            n=$((n+1))
+            echo "Tentativo $n - $(date +%H:%M:%S)"
 
-          JOB=$(oci resource-manager job create-apply-job --stack-id "$STACK_ID" \
-            --execution-plan-strategy AUTO_APPROVED \
-            --wait-for-state SUCCEEDED --wait-for-state FAILED --wait-for-state CANCELED \
-            --max-wait-seconds 900 2>/tmp/err)
-          STATE=$(echo "$JOB" | jq -r '.data."lifecycle-state" // empty')
-          JOB_ID=$(echo "$JOB" | jq -r '.data.id // empty')
+            COUNT=$(oci compute instance list --compartment-id "$TENANCY" --lifecycle-state RUNNING --all --query 'length(data)' --raw-output 2>/dev/null)
+            if [ "${COUNT:-0}" -gt 0 ]; then
+              echo "La macchina esiste gia, fine."
+              exit 0
+            fi
 
-          if [ -z "$JOB_ID" ]; then
-            if grep -qiE "TooManyRequests|429|Conflict|409" /tmp/err; then echo "Oracle occupato, riprovo dopo"; exit 0; fi
-            echo "ERRORE NEL LANCIO:"; tail -20 /tmp/err
-            curl -s -H "Title: Script Oracle fermo" -d "Errore nel lancio del job, controlla GitHub" "$NTFY"
+            JOB=$(oci resource-manager job create-apply-job --stack-id "$STACK_ID" \
+              --execution-plan-strategy AUTO_APPROVED \
+              --wait-for-state SUCCEEDED --wait-for-state FAILED --wait-for-state CANCELED \
+              --max-wait-seconds 900 2>/tmp/err)
+            STATE=$(echo "$JOB" | jq -r '.data."lifecycle-state" // empty')
+            JOB_ID=$(echo "$JOB" | jq -r '.data.id // empty')
+
+            if [ -z "$JOB_ID" ]; then
+              if grep -qiE "TooManyRequests|429|Conflict|409" /tmp/err; then
+                echo "Oracle occupato, aspetto 3 minuti"; sleep 180; continue
+              fi
+              echo "ERRORE NEL LANCIO:"; tail -20 /tmp/err
+              curl -s -H "Title: Script Oracle fermo" -d "Errore nel lancio del job, controlla GitHub" "$NTFY"
+              exit 1
+            fi
+
+            if [ "$STATE" = "SUCCEEDED" ]; then
+              echo ">>> MACCHINA CREATA! <<<"
+              curl -s -H "Title: Server Minecraft" -H "Priority: high" -d "MACCHINA ORACLE CREATA!" "$NTFY"
+              exit 0
+            fi
+
+            LOGS=$(oci resource-manager job get-job-logs-content --job-id "$JOB_ID" --query data --raw-output)
+            if echo "$LOGS" | grep -qi "capacity"; then
+              echo "Out of capacity, riprovo tra 90 secondi"; sleep 90; continue
+            fi
+
+            echo "ERRORE DIVERSO:"; echo "$LOGS" | grep -iE "error|fail" | tail -20
+            curl -s -H "Title: Script Oracle fermo" -d "Errore diverso da out of capacity, controlla GitHub" "$NTFY"
             exit 1
-          fi
+          done
 
-          if [ "$STATE" = "SUCCEEDED" ]; then
-            echo ">>> MACCHINA CREATA! <<<"
-            curl -s -H "Title: Server Minecraft" -H "Priority: high" -d "MACCHINA ORACLE CREATA!" "$NTFY"
-            exit 1
-          fi
-
-          LOGS=$(oci resource-manager job get-job-logs-content --job-id "$JOB_ID" --query data --raw-output)
-          if echo "$LOGS" | grep -qi "capacity"; then echo "Out of capacity, riprovo al prossimo giro"; exit 0; fi
-
-          echo "ERRORE DIVERSO:"; echo "$LOGS" | grep -iE "error|fail" | tail -20
-          curl -s -H "Title: Script Oracle fermo" -d "Errore diverso da out of capacity, controlla GitHub" "$NTFY"
-          exit 1
+          echo "Turno di 5 ore e mezza finito, mi rilancio da solo"
+          gh workflow run retry.yml --repo "$GITHUB_REPOSITORY"
