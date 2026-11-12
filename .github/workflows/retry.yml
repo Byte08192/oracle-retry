@@ -1,0 +1,69 @@
+name: Prova macchina Oracle
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+concurrency:
+  group: oracle-retry
+  cancel-in-progress: false
+jobs:
+  prova:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Installa OCI CLI
+        run: pip install oci-cli
+      - name: Configura credenziali
+        env:
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          echo "$OCI_KEY" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY }}
+          region=eu-milan-1
+          key_file=~/.oci/key.pem
+          EOF
+          chmod 600 ~/.oci/config
+      - name: Prova a creare la macchina
+        env:
+          STACK_ID: ${{ secrets.STACK_ID }}
+          TENANCY: ${{ secrets.OCI_TENANCY }}
+          NTFY: ntfy.sh/minecraft-andrea-x7k29q
+        run: |
+          COUNT=$(oci compute instance list --compartment-id "$TENANCY" --lifecycle-state RUNNING --all --query 'length(data)' --raw-output 2>/dev/null)
+          if [ "${COUNT:-0}" -gt 0 ]; then echo "La macchina esiste gia, niente da fare"; exit 0; fi
+
+          JOB=$(oci resource-manager job create-apply-job --stack-id "$STACK_ID" \
+            --execution-plan-strategy AUTO_APPROVED \
+            --wait-for-state SUCCEEDED --wait-for-state FAILED --wait-for-state CANCELED \
+            --max-wait-seconds 900 2>/tmp/err)
+          STATE=$(echo "$JOB" | jq -r '.data."lifecycle-state" // empty')
+          JOB_ID=$(echo "$JOB" | jq -r '.data.id // empty')
+
+          if [ -z "$JOB_ID" ]; then
+            if grep -qiE "TooManyRequests|429|Conflict|409" /tmp/err; then echo "Oracle occupato, riprovo dopo"; exit 0; fi
+            echo "ERRORE NEL LANCIO:"; tail -20 /tmp/err
+            curl -s -H "Title: Script Oracle fermo" -d "Errore nel lancio del job, controlla GitHub" "$NTFY"
+            exit 1
+          fi
+
+          if [ "$STATE" = "SUCCEEDED" ]; then
+            echo ">>> MACCHINA CREATA! <<<"
+            curl -s -H "Title: Server Minecraft" -H "Priority: high" -d "MACCHINA ORACLE CREATA!" "$NTFY"
+            exit 1
+          fi
+
+          LOGS=$(oci resource-manager job get-job-logs-content --job-id "$JOB_ID" --query data --raw-output)
+          if echo "$LOGS" | grep -qi "capacity"; then echo "Out of capacity, riprovo al prossimo giro"; exit 0; fi
+
+          echo "ERRORE DIVERSO:"; echo "$LOGS" | grep -iE "error|fail" | tail -20
+          curl -s -H "Title: Script Oracle fermo" -d "Errore diverso da out of capacity, controlla GitHub" "$NTFY"
+          exit 1
