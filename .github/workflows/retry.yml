@@ -36,78 +36,61 @@ jobs:
           chmod 600 ~/.oci/config
       - name: Prova finche non trova la macchina
         env:
-          STACK_ID: ${{ secrets.STACK_ID }}
           TENANCY: ${{ secrets.OCI_TENANCY }}
           NTFY: ntfy.sh/minecraft-andrea-x7k29q
           GH_TOKEN: ${{ github.token }}
         run: |
           set +e +o pipefail
+          echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCyKUB+v6L8Q4krVAc8KWaX0gRN5Kko8uTiy+m2ooqIdgXi46IAebnfduXvul3Wz3RMH/0ynXaiZVvhQItrrFTBTrYu+GpYpH3Fd0/jr6rzSF5auLnLqZzif8O6Iu7OYhHkUXcKRz17+u/cu7Nqm6CIW0jIcilMdVHz6JRmwoILw5EPfzCeig3yEFgjrIVZfDRKJLHFOes37N84Zrrr4w6LhyNU5OgCULvT9Vdi5O9PIlZScqlOstvsAMOGmfz6VgtJ34IcPgnKys2zpWHRHzxKgLzSgSS2uBqPwv49+YNMUE8nIPy1j/iSjsUPcm6H78cFqomVqnJBzUWN082OocV7 ssh-key-2026-11-11" > key.pub
+
+          AD=$(oci iam availability-domain list --compartment-id "$TENANCY" --query 'data[0].name' --raw-output 2>/dev/null)
+          SUBNET=$(oci network subnet list --compartment-id "$TENANCY" --all --query 'data[?"prohibit-public-ip-on-vnic"==`false`] | [0].id' --raw-output 2>/dev/null)
+          IMG=$(oci compute image list --compartment-id "$TENANCY" --operating-system "Canonical Ubuntu" --operating-system-version "24.04" --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC --all --query 'data[?!contains("display-name", `Minimal`)] | [0].id' --raw-output 2>/dev/null)
+          echo "AD: $AD"
+          echo "Subnet: $SUBNET"
+          echo "Immagine: $IMG"
+          if [ -z "$AD" ] || [ -z "$SUBNET" ] || [ -z "$IMG" ]; then
+            echo "Manca qualcosa (rete o immagine), script fermato"
+            curl -s -H "Title: Script Oracle fermo" -d "Manca subnet o immagine, controlla GitHub" "$NTFY"
+            exit 1
+          fi
+
           FINE=$(( $(date +%s) + 19800 ))
           n=0
           errori=0
           while [ "$(date +%s)" -lt "$FINE" ]; do
-            n=$((n+1))
-            echo "Tentativo $n - $(date +%H:%M:%S)"
-
             COUNT=$(oci compute instance list --compartment-id "$TENANCY" --lifecycle-state RUNNING --all --query 'length(data)' --raw-output 2>/dev/null)
             case "$COUNT" in ''|*[!0-9]*) COUNT=0 ;; esac
-            if [ "$COUNT" -gt 0 ]; then
-              echo "La macchina esiste gia, fine."
-              exit 0
-            fi
+            if [ "$COUNT" -gt 0 ]; then echo "La macchina esiste gia, fine."; exit 0; fi
 
-            JOB_ID=$(oci resource-manager job create-apply-job --stack-id "$STACK_ID" \
-              --execution-plan-strategy AUTO_APPROVED \
+            n=$((n+1))
+            echo "Tentativo $n - $(date +%H:%M:%S)"
+            ID=$(oci compute instance launch --availability-domain "$AD" --compartment-id "$TENANCY" \
+              --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+              --image-id "$IMG" --subnet-id "$SUBNET" \
+              --assign-public-ip true --display-name minecraft --ssh-authorized-keys-file key.pub \
               --query 'data.id' --raw-output 2>/tmp/err)
 
-            if [ -z "$JOB_ID" ]; then
-              errori=$((errori+1))
-              echo "Oracle occupato nel lancio ($errori/10), riprovo tra 3 minuti"
-              grep -E '"status"|"code"' /tmp/err | head -2
-              if [ "$errori" -ge 10 ]; then
-                curl -s -H "Title: Script Oracle fermo" -d "10 errori di fila, controlla GitHub" "$NTFY"
-                exit 1
-              fi
-              sleep 180; continue
-            fi
-
-            STATE=""
-            for i in $(seq 1 60); do
-              sleep 20
-              S=$(oci resource-manager job get --job-id "$JOB_ID" --query 'data."lifecycle-state"' --raw-output 2>/dev/null)
-              [ -n "$S" ] && STATE="$S"
-              case "$STATE" in SUCCEEDED|FAILED|CANCELED) break ;; esac
-            done
-            echo "Stato job: $STATE"
-
-            if [ "$STATE" = "SUCCEEDED" ]; then
+            if [ -n "$ID" ]; then
               echo ">>> MACCHINA CREATA! <<<"
-              curl -s -H "Title: Server Minecraft" -H "Priority: high" -d "MACCHINA ORACLE CREATA!" "$NTFY"
+              curl -s -H "Title: Server Minecraft" -H "Priority: high" -d "MACCHINA ORACLE CREATA! 2 OCPU / 12 GB" "$NTFY"
               exit 0
             fi
 
-            sleep 10
-            LOGS=$(oci resource-manager job get-job-logs-content --job-id "$JOB_ID" --query data --raw-output 2>/dev/null)
-
-            if echo "$LOGS" | grep -qi "capacity"; then
-              errori=0
-              echo "Out of capacity, riprovo tra 90 secondi"; sleep 90; continue
-            fi
-
-            if [ -z "$LOGS" ] || [ "$STATE" != "FAILED" ] || echo "$LOGS" | grep -qiE "TooManyRequests|429|Conflict|409|InternalError|500|timeout"; then
+            if grep -qi "capacity" /tmp/err; then
+              echo "Out of capacity"; errori=0
+            elif grep -qiE "TooManyRequests|429" /tmp/err; then
+              echo "Troppe richieste, aspetto un minuto"; sleep 60
+            else
               errori=$((errori+1))
-              echo "Errore temporaneo ($errori/10), riprovo tra 3 minuti"
+              echo "Errore ($errori/10):"; grep -E '"code"|"message"' /tmp/err | head -3
               if [ "$errori" -ge 10 ]; then
                 curl -s -H "Title: Script Oracle fermo" -d "10 errori di fila, controlla GitHub" "$NTFY"
                 exit 1
               fi
-              sleep 180; continue
             fi
-
-            echo "ERRORE DIVERSO:"; echo "$LOGS" | grep -iE "error|fail" | tail -20
-            curl -s -H "Title: Script Oracle fermo" -d "Errore diverso da out of capacity, controlla GitHub" "$NTFY"
-            exit 1
+            sleep 30
           done
 
-          echo "Turno di 5 ore e mezza finito, mi rilancio da solo"
+          echo "Turno finito, mi rilancio da solo"
           gh workflow run retry.yml --repo "$GITHUB_REPOSITORY"
