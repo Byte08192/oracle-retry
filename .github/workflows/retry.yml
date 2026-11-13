@@ -59,7 +59,7 @@ jobs:
           n=0
           errori=0
           while [ "$(date +%s)" -lt "$FINE" ]; do
-            COUNT=$(oci compute instance list --compartment-id "$TENANCY" --lifecycle-state RUNNING --all --query 'length(data)' --raw-output 2>/dev/null)
+            COUNT=$(oci compute instance list --compartment-id "$TENANCY" --all --query 'length(data[?"lifecycle-state"!=`TERMINATED` && "lifecycle-state"!=`TERMINATING`])' --raw-output 2>/dev/null)
             case "$COUNT" in ''|*[!0-9]*) COUNT=0 ;; esac
             if [ "$COUNT" -gt 0 ]; then echo "La macchina esiste gia, fine."; exit 0; fi
 
@@ -67,30 +67,4 @@ jobs:
             echo "Tentativo $n - $(date +%H:%M:%S)"
             ID=$(oci compute instance launch --availability-domain "$AD" --compartment-id "$TENANCY" \
               --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-              --image-id "$IMG" --subnet-id "$SUBNET" \
-              --assign-public-ip true --display-name minecraft --ssh-authorized-keys-file key.pub \
-              --query 'data.id' --raw-output 2>/tmp/err)
-
-            if [ -n "$ID" ]; then
-              echo ">>> MACCHINA CREATA! <<<"
-              curl -s -H "Title: Server Minecraft" -H "Priority: high" -d "MACCHINA ORACLE CREATA! 2 OCPU / 12 GB" "$NTFY"
-              exit 0
-            fi
-
-            if grep -qi "capacity" /tmp/err; then
-              echo "Out of capacity"; errori=0
-            elif grep -qiE "TooManyRequests|429" /tmp/err; then
-              echo "Troppe richieste, aspetto un minuto"; sleep 60
-            else
-              errori=$((errori+1))
-              echo "Errore ($errori/10):"; grep -E '"code"|"message"' /tmp/err | head -3
-              if [ "$errori" -ge 10 ]; then
-                curl -s -H "Title: Script Oracle fermo" -d "10 errori di fila, controlla GitHub" "$NTFY"
-                exit 1
-              fi
-            fi
-            sleep 30
-          done
-
-          echo "Turno finito, mi rilancio da solo"
-          gh workflow run retry.yml --repo "$GITHUB_REPOSITORY"
+              
