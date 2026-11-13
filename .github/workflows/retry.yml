@@ -55,16 +55,20 @@ jobs:
             exit 1
           fi
 
+          conta_macchine() {
+            oci compute instance list --compartment-id "$TENANCY" --all 2>/dev/null \
+              | jq '[.data[]? | select(."lifecycle-state" != "TERMINATED" and ."lifecycle-state" != "TERMINATING")] | length' 2>/dev/null
+          }
+
           FINE=$(( $(date +%s) + 19800 ))
           n=0
           errori=0
           while [ "$(date +%s)" -lt "$FINE" ]; do
-            COUNT=$(oci compute instance list --compartment-id "$TENANCY" --all --query 'length(data[?"lifecycle-state"!=`TERMINATED` && "lifecycle-state"!=`TERMINATING`])' --raw-output 2>/dev/null)
+            COUNT=$(conta_macchine)
             case "$COUNT" in ''|*[!0-9]*) COUNT=0 ;; esac
             if [ "$COUNT" -gt 0 ]; then echo "La macchina esiste gia, fine."; exit 0; fi
 
             n=$((n+1))
             echo "Tentativo $n - $(date +%H:%M:%S)"
             ID=$(oci compute instance launch --availability-domain "$AD" --compartment-id "$TENANCY" \
-              --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-              
+              --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,
